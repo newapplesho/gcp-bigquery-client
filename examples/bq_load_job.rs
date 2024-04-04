@@ -10,34 +10,32 @@ use gcp_bigquery_client::model::job_configuration_load::JobConfigurationLoad;
 use gcp_bigquery_client::model::job_reference::JobReference;
 use gcp_bigquery_client::model::job_status::JobStatus;
 use gcp_bigquery_client::model::table_reference::TableReference;
-use gcp_bigquery_client::Client;
 
 /// This example explains how to initiate and supervise a BQ load job (new line delimited json file in GCS).
 use std::env;
-use std::thread::sleep;
-use std::time::Duration;
 
-const GCS_BUCKET_NAME: &'static str = "rust_bq_client";
+#[cfg(feature = "bq_load_job")]
+const GCS_BUCKET_NAME: &str = "rust_bq_client";
 
 // #[cfg(not(feature = "bq_load_job"))]
 // fn main() {}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (gcp_sa_key, project_id) = env_vars();
+    let (_gcp_sa_key, _project_id) = env_vars();
 
     // Create temporary file name
-    let tmp_file_name = tmp_file_name(30);
+    let _tmp_file_name = tmp_file_name(30);
 
     // Load line delimiter json data file
-    let data = std::fs::read("examples/data.json").expect("data.json not found");
+    let _data = std::fs::read("examples/data.json").expect("data.json not found");
 
     #[cfg(feature = "bq_load_job")]
     {
         // Store data on GCS
         let source_uri = store_and_get_gcs_uri(GCS_BUCKET_NAME, data, &tmp_file_name).await?;
 
-        let client = Client::from_service_account_key_file(&gcp_sa_key).await;
+        let client = Client::from_service_account_key_file(&gcp_sa_key).await?;
 
         // Create BQ load job to create/update the test with the content of the json data file
         // Pre-requisite: test_batch_load dataset already created

@@ -1,28 +1,46 @@
 //! Manage BigQuery jobs.
-use reqwest::Client;
+use std::sync::Arc;
 
-use crate::auth::ServiceAccountAuthenticator;
+use async_stream::stream;
+use reqwest::Client;
+use tokio_stream::Stream;
+
+use crate::auth::Authenticator;
 use crate::error::BQError;
 use crate::model::get_query_results_parameters::GetQueryResultsParameters;
-use crate::model::get_query_results_response::{GetQueryResultsResponse, PaginatedResultSet};
+use crate::model::get_query_results_response::GetQueryResultsResponse;
 use crate::model::job::Job;
 use crate::model::job_cancel_response::JobCancelResponse;
 use crate::model::job_configuration::JobConfiguration;
 use crate::model::job_configuration_query::JobConfigurationQuery;
 use crate::model::job_list::JobList;
+use crate::model::job_list_parameters::JobListParameters;
+use crate::model::job_reference::JobReference;
 use crate::model::query_request::QueryRequest;
 use crate::model::query_response::{QueryResponse, ResultSet};
-use crate::{process_response, urlencode};
+use crate::model::table_row::TableRow;
+use crate::{process_response, urlencode, BIG_QUERY_V2_URL};
 
 /// A job API handler.
+#[derive(Clone)]
 pub struct JobApi {
     client: Client,
-    sa_auth: ServiceAccountAuthenticator,
+    auth: Arc<dyn Authenticator>,
+    base_url: String,
 }
 
 impl JobApi {
-    pub(crate) fn new(client: Client, sa_auth: ServiceAccountAuthenticator) -> Self {
-        Self { client, sa_auth }
+    pub(crate) fn new(client: Client, auth: Arc<dyn Authenticator>) -> Self {
+        Self {
+            client,
+            auth,
+            base_url: BIG_QUERY_V2_URL.to_string(),
+        }
+    }
+
+    pub(crate) fn with_base_url(&mut self, base_url: String) -> &mut Self {
+        self.base_url = base_url;
+        self
     }
 
     /// Runs a BigQuery SQL query synchronously and returns query results if the query completes within a specified
@@ -32,11 +50,12 @@ impl JobApi {
     /// * `query_request` - The request body contains an instance of QueryRequest.
     pub async fn query(&self, project_id: &str, query_request: QueryRequest) -> Result<ResultSet, BQError> {
         let req_url = format!(
-            "https://bigquery.googleapis.com/bigquery/v2/projects/{project_id}/queries",
+            "{base_url}/projects/{project_id}/queries",
+            base_url = self.base_url,
             project_id = urlencode(project_id)
         );
 
-        let access_token = self.sa_auth.access_token().await?;
+        let access_token = self.auth.access_token().await?;
 
         let request = self
             .client
@@ -57,49 +76,184 @@ impl JobApi {
     /// * `query` - The initial query configuration that is submitted when the job is inserted.
     /// * `page_size` - The size of each page fetched. By default, this is set to `None`, and the limit is 10 MB of
     /// rows instead.
-    pub async fn query_all(
-        &self,
-        project_id: &str,
+    pub fn query_all<'a>(
+        &'a self,
+        project_id: &'a str,
         query: JobConfigurationQuery,
         page_size: Option<i32>,
-    ) -> Result<PaginatedResultSet, BQError> {
-        let job = Job {
-            configuration: Some(JobConfiguration {
-                dry_run: Some(false),
-                query: Some(query),
+    ) -> impl Stream<Item = Result<Vec<TableRow>, BQError>> + 'a {
+        stream! {
+            let job = Job {
+                configuration: Some(JobConfiguration {
+                    dry_run: Some(false),
+                    query:   Some(query),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        };
+            };
 
-        let mut rs = PaginatedResultSet::default();
+            let job = self.insert(project_id, job).await?;
 
-        let job = self.insert(project_id, job).await?;
-        if let Some(ref job_id) = job.job_reference.and_then(|r| r.job_id) {
-            let mut page_token: Option<String> = None;
-            loop {
-                let qr = self
-                    .get_query_results(
-                        project_id,
-                        job_id,
-                        GetQueryResultsParameters {
-                            page_token,
-                            max_results: page_size,
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
+            if let Some(ref job_id) = job.job_reference.and_then(|r| r.job_id) {
+                let mut page_token: Option<String> = None;
+                loop {
+                    let qr = self
+                        .get_query_results(
+                            project_id,
+                            job_id,
+                            GetQueryResultsParameters {
+                                page_token: page_token.clone(),
+                                max_results: page_size,
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
 
-                rs.append(qr.rows);
+                    // Waiting for the job to be completed.
+                    if !qr.job_complete.unwrap_or(false) {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
 
-                if qr.page_token.is_none() {
-                    break;
+                    // Rows is present when the query finishes successfully.
+                    // Rows is empty when query result is empty.
+                    yield Ok(qr.rows.unwrap_or_default());
+
+                    page_token = match qr.page_token {
+                        None => break,
+                        f => f,
+                    };
                 }
-                page_token = qr.page_token;
             }
         }
+    }
 
-        Ok(rs)
+    /// Runs a BigQuery SQL query, paginating through all the results synchronously.
+    /// Use this function when location of the job differs from the default value (US)
+    /// # Arguments
+    /// * `project_id`- Project ID of the query request.
+    /// * `location`  - Geographic location of the job.
+    /// * `query` - The initial query configuration that is submitted when the job is inserted.
+    /// * `page_size` - The size of each page fetched. By default, this is set to `None`, and the limit is 10 MB of
+    /// rows instead.
+    pub fn query_all_with_location<'a>(
+        &'a self,
+        project_id: &'a str,
+        location: &'a str,
+        query: JobConfigurationQuery,
+        page_size: Option<i32>,
+    ) -> impl Stream<Item = Result<Vec<TableRow>, BQError>> + 'a {
+        stream! {
+            let job = Job {
+                configuration: Some(JobConfiguration {
+                    dry_run: Some(false),
+                    query:   Some(query),
+                    ..Default::default()
+                }),
+                job_reference: Some(JobReference {
+                    location:   Some(location.to_string()),
+                    project_id: Some(project_id.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            let job = self.insert(project_id, job).await?;
+
+            if let Some(ref job_id) = job.job_reference.and_then(|r| r.job_id) {
+                let mut page_token: Option<String> = None;
+                loop {
+                    let qr = self
+                        .get_query_results(
+                            project_id,
+                            job_id,
+                            GetQueryResultsParameters {
+                                page_token: page_token.clone(),
+                                max_results: page_size,
+                                location:    Some(location.to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+
+                        // Waiting for completed the job.
+                        if !qr.job_complete.unwrap_or(false) {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+                            continue;
+                        }
+
+
+                    // Rows is present when the query finishes successfully.
+                    // Rows be empty when query result is empty.
+                    yield Ok(qr.rows.unwrap_or_default());
+
+                    page_token = match qr.page_token {
+                        None => break,
+                        f => f,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Runs a BigQuery SQL query, paginating through all the results synchronously.
+    /// Use this function when you need to have your job with non-default location, project_id & job_id values
+    /// # Arguments
+    /// * `project_id`- Project ID of the query request.
+    /// * `job_reference` - The initital job reference configuration that is submitted when the job is inserted
+    /// * `query` - The initial query configuration that is submitted when the job is inserted.
+    /// * `page_size` - The size of each page fetched. By default, this is set to `None`, and the limit is 10 MB of
+    /// rows instead.
+    pub fn query_all_with_job_reference<'a>(
+        &'a self,
+        project_id: &'a str,
+        job_reference: JobReference,
+        query: JobConfigurationQuery,
+        page_size: Option<i32>,
+    ) -> impl Stream<Item = Result<Vec<TableRow>, BQError>> + 'a {
+        stream! {
+            let location = job_reference.location.as_ref().cloned();
+
+            let job = Job {
+                configuration: Some(JobConfiguration {
+                    dry_run: Some(false),
+                    query:   Some(query),
+                    ..Default::default()
+                }),
+                job_reference: Some(job_reference),
+                ..Default::default()
+            };
+
+            let job = self.insert(project_id, job).await?;
+
+            if let Some(ref job_id) = job.job_reference.and_then(|r| r.job_id) {
+                let mut page_token: Option<String> = None;
+                loop {
+                    let gqrp = GetQueryResultsParameters {
+                                page_token,
+                                max_results: page_size,
+                                location:    location.clone(),
+                                ..Default::default()
+                            };
+                    let qr = self
+                        .get_query_results(
+                            project_id,
+                            job_id,
+                            gqrp,
+                        )
+                        .await?;
+
+                    // Rows is present when the query finishes successfully.
+                    yield Ok(qr.rows.expect("Rows are not present"));
+
+                    page_token = match qr.page_token {
+                        None => break,
+                        f => f,
+                    };
+                }
+            }
+        }
     }
 
     /// Starts a new asynchronous job.
@@ -108,11 +262,12 @@ impl JobApi {
     /// * `job` - The request body contains an instance of Job.
     pub async fn insert(&self, project_id: &str, job: Job) -> Result<Job, BQError> {
         let req_url = format!(
-            "https://bigquery.googleapis.com/bigquery/v2/projects/{project_id}/jobs",
+            "{base_url}/projects/{project_id}/jobs",
+            base_url = self.base_url,
             project_id = urlencode(project_id)
         );
 
-        let access_token = self.sa_auth.access_token().await?;
+        let access_token = self.auth.access_token().await?;
 
         let request = self
             .client
@@ -133,17 +288,63 @@ impl JobApi {
     /// * `project_id` - Project ID of the jobs to list.
     pub async fn list(&self, project_id: &str) -> Result<JobList, BQError> {
         let req_url = format!(
-            "https://bigquery.googleapis.com/bigquery/v2/projects/{project_id}/jobs",
+            "{base_url}/projects/{project_id}/jobs",
+            base_url = self.base_url,
             project_id = urlencode(project_id)
         );
 
-        let access_token = self.sa_auth.access_token().await?;
+        let access_token = self.auth.access_token().await?;
 
         let request = self.client.get(req_url.as_str()).bearer_auth(access_token).build()?;
 
         let resp = self.client.execute(request).await?;
 
         process_response(resp).await
+    }
+
+    /// Lists all jobs that you started in the specified project paginating through all the results synchronously.
+    /// Job information is available for a six month period after creation.
+    /// The job list is sorted in reverse chronological order, by job creation time. Requires the Can
+    /// View project role, or the Is Owner project role if you set the allUsers property.
+    /// # Arguments
+    /// * `project_id` - Project ID of the jobs to list.
+    /// * `parameters` - The query parameters for jobs.list.
+    pub fn get_job_list<'a>(
+        &'a self,
+        project_id: &'a str,
+        parameters: Option<JobListParameters>,
+    ) -> impl Stream<Item = Result<JobList, BQError>> + 'a {
+        stream! {
+            let req_url = format!(
+                "{base_url}/projects/{project_id}/jobs",
+                base_url = self.base_url,
+                project_id = urlencode(project_id),
+                );
+            let mut params = parameters.unwrap_or_default();
+            let mut page_token: Option<String> = None;
+            loop {
+                let mut request_builder = self.client.get(req_url.as_str());
+
+                params.page_token = page_token;
+                request_builder = request_builder.query(&params);
+
+                let access_token = self.auth.access_token().await?;
+                let request = request_builder.bearer_auth(access_token).build()?;
+
+                let resp = self.client.execute(request).await?;
+
+                let process_resp: Result<JobList, BQError> = process_response(resp).await;
+
+                yield match process_resp {
+                    Err(e) => {page_token=None; Err(e)},
+                    Ok(job_list) => {page_token=job_list.next_page_token.clone(); Ok(job_list.clone())}
+                };
+
+                if page_token.is_none() {
+                    break;
+                }
+            }
+        }
     }
 
     /// RPC to get the results of a query job.
@@ -158,12 +359,13 @@ impl JobApi {
         parameters: GetQueryResultsParameters,
     ) -> Result<GetQueryResultsResponse, BQError> {
         let req_url = format!(
-            "https://bigquery.googleapis.com/bigquery/v2/projects/{project_id}/queries/{job_id}",
+            "{base_url}/projects/{project_id}/queries/{job_id}",
+            base_url = self.base_url,
             project_id = urlencode(project_id),
             job_id = urlencode(job_id),
         );
 
-        let access_token = self.sa_auth.access_token().await?;
+        let access_token = self.auth.access_token().await?;
 
         let request = self
             .client
@@ -188,7 +390,8 @@ impl JobApi {
     /// details at https://cloud.google.com/bigquery/docs/locations#specifying_your_location.
     pub async fn get_job(&self, project_id: &str, job_id: &str, location: Option<&str>) -> Result<Job, BQError> {
         let req_url = format!(
-            "https://bigquery.googleapis.com/bigquery/v2/projects/{project_id}/jobs/{job_id}",
+            "{base_url}/projects/{project_id}/jobs/{job_id}",
+            base_url = self.base_url,
             project_id = urlencode(project_id),
             job_id = urlencode(job_id),
         );
@@ -199,7 +402,7 @@ impl JobApi {
             request_builder = request_builder.query(&[("location", location)]);
         }
 
-        let access_token = self.sa_auth.access_token().await?;
+        let access_token = self.auth.access_token().await?;
         let request = request_builder.bearer_auth(access_token).build()?;
 
         let resp = self.client.execute(request).await?;
@@ -222,7 +425,8 @@ impl JobApi {
         location: Option<&str>,
     ) -> Result<JobCancelResponse, BQError> {
         let req_url = format!(
-            "https://bigquery.googleapis.com/bigquery/v2/projects/{project_id}/jobs/{job_id}/cancel",
+            "{base_url}/projects/{project_id}/jobs/{job_id}/cancel",
+            base_url = self.base_url,
             project_id = urlencode(project_id),
             job_id = urlencode(job_id),
         );
@@ -233,7 +437,7 @@ impl JobApi {
             request_builder = request_builder.query(&[("location", location)]);
         }
 
-        let access_token = self.sa_auth.access_token().await?;
+        let access_token = self.auth.access_token().await?;
 
         let request = request_builder.bearer_auth(access_token).build()?;
 
@@ -246,10 +450,16 @@ impl JobApi {
 #[cfg(test)]
 mod test {
     use serde::Serialize;
+    use tokio_stream::StreamExt;
 
     use crate::error::BQError;
     use crate::model::dataset::Dataset;
+    use crate::model::field_type::serialize_json_as_string;
     use crate::model::job_configuration_query::JobConfigurationQuery;
+    use crate::model::job_reference::JobReference;
+    use crate::model::query_parameter::QueryParameter;
+    use crate::model::query_parameter_type::QueryParameterType;
+    use crate::model::query_parameter_value::QueryParameterValue;
     use crate::model::query_request::QueryRequest;
     use crate::model::query_response::{QueryResponse, ResultSet};
     use crate::model::table::Table;
@@ -265,6 +475,9 @@ mod test {
         bool_value: bool,
         string_value: String,
         record_value: FirstRecordLevel,
+        // Serialized as string but deserialized as serde json value.
+        #[serde(serialize_with = "serialize_json_as_string")]
+        json_value: serde_json::value::Value,
     }
 
     #[derive(Serialize)]
@@ -283,16 +496,16 @@ mod test {
     #[tokio::test]
     async fn test() -> Result<(), BQError> {
         let (ref project_id, ref dataset_id, ref table_id, ref sa_key) = env_vars();
-        let dataset_id = &format!("{}_job", dataset_id);
+        let dataset_id = &format!("{dataset_id}_job");
 
-        let client = Client::from_service_account_key_file(sa_key).await;
+        let client = Client::from_service_account_key_file(sa_key).await?;
 
         client.table().delete_if_exists(project_id, dataset_id, table_id).await;
         client.dataset().delete_if_exists(project_id, dataset_id, true).await;
 
         // Create dataset
         let created_dataset = client.dataset().create(Dataset::new(project_id, dataset_id)).await?;
-        assert_eq!(created_dataset.id, Some(format!("{}:{}", project_id, dataset_id)));
+        assert_eq!(created_dataset.id, Some(format!("{project_id}:{dataset_id}")));
 
         // Create table
         let table = Table::new(
@@ -318,6 +531,7 @@ mod test {
                         ),
                     ],
                 ),
+                TableFieldSchema::json("json_value"),
             ]),
         );
 
@@ -341,6 +555,7 @@ mod test {
                         string_value: "leaf".to_string(),
                     },
                 },
+                json_value: serde_json::from_str("{\"a\":2,\"b\":\"hello\"}")?,
             },
         )?;
         insert_request.add_row(
@@ -358,6 +573,7 @@ mod test {
                         string_value: "leaf".to_string(),
                     },
                 },
+                json_value: serde_json::from_str("{\"a\":1,\"b\":\"goodbye\",\"c\":3}")?,
             },
         )?;
         insert_request.add_row(
@@ -375,6 +591,7 @@ mod test {
                         string_value: "leaf".to_string(),
                     },
                 },
+                json_value: serde_json::from_str("{\"b\":\"world\",\"c\":2}")?,
             },
         )?;
         insert_request.add_row(
@@ -392,6 +609,7 @@ mod test {
                         string_value: "leaf".to_string(),
                     },
                 },
+                json_value: serde_json::from_str("{\"a\":3,\"c\":1}")?,
             },
         )?;
 
@@ -403,6 +621,8 @@ mod test {
             .await;
 
         assert!(result.is_ok(), "{:?}", result);
+        let result = result.unwrap();
+        assert!(result.insert_errors.is_none(), "{:?}", result);
 
         // Query
         let mut rs = client
@@ -410,8 +630,7 @@ mod test {
             .query(
                 project_id,
                 QueryRequest::new(format!(
-                    "SELECT COUNT(*) AS c FROM `{}.{}.{}`",
-                    project_id, dataset_id, table_id
+                    "SELECT COUNT(*) AS c FROM `{project_id}.{dataset_id}.{table_id}`"
                 )),
             )
             .await?;
@@ -443,8 +662,8 @@ mod test {
             assert!(rs.get_i64_by_name("c")?.is_some());
         }
 
-        //Query all
-        let query_all_results = client
+        // Query all
+        let query_all_results: Result<Vec<_>, _> = client
             .job()
             .query_all(
                 project_id,
@@ -456,10 +675,87 @@ mod test {
                 },
                 Some(2),
             )
-            .await?;
+            .collect::<Result<Vec<_>, _>>()
+            .await
+            .map(|vec_of_vecs| vec_of_vecs.into_iter().flatten().collect());
 
-        assert_eq!(query_all_results.rows().len(), n_rows);
+        assert!(query_all_results.is_ok());
+        assert_eq!(query_all_results.unwrap().len(), n_rows);
 
+        // Query all with location
+        let location = "us";
+        let query_all_results_with_location: Result<Vec<_>, _> = client
+            .job()
+            .query_all_with_location(
+                project_id,
+                location,
+                JobConfigurationQuery {
+                    query: format!("SELECT * FROM `{project_id}.{dataset_id}.{table_id}`"),
+                    query_parameters: None,
+                    use_legacy_sql: Some(false),
+                    ..Default::default()
+                },
+                Some(2),
+            )
+            .collect::<Result<Vec<_>, _>>()
+            .await
+            .map(|vec_of_vecs| vec_of_vecs.into_iter().flatten().collect());
+
+        assert!(query_all_results_with_location.is_ok());
+        assert_eq!(query_all_results_with_location.unwrap().len(), n_rows);
+
+        // Query all with JobReference
+        let job_reference = JobReference {
+            project_id: Some(project_id.to_string()),
+            location: Some(location.to_string()),
+            ..Default::default()
+        };
+        let query_all_results_with_job_reference: Result<Vec<_>, _> = client
+            .job()
+            .query_all_with_job_reference(
+                project_id,
+                job_reference,
+                JobConfigurationQuery {
+                    query: format!("SELECT * FROM `{project_id}.{dataset_id}.{table_id}`"),
+                    query_parameters: None,
+                    use_legacy_sql: Some(false),
+                    ..Default::default()
+                },
+                Some(2),
+            )
+            .collect::<Result<Vec<_>, _>>()
+            .await
+            .map(|vec_of_vecs| vec_of_vecs.into_iter().flatten().collect());
+
+        assert!(query_all_results_with_job_reference.is_ok());
+        assert_eq!(query_all_results_with_job_reference.unwrap().len(), n_rows);
+
+        // Query all with json parameter
+        let query_all_results_with_parameter: Result<Vec<_>, _> = client
+            .job()
+            .query_all(
+                project_id,
+                JobConfigurationQuery {
+                    query: format!("SELECT int_value, json_value.a, json_value.b FROM `{project_id}.{dataset_id}.{table_id}` where CAST(JSON_VALUE(json_value,'$.a') as int) >= @compare"),
+                    query_parameters: Some(vec![QueryParameter {
+                        name: Some("compare".to_string()),
+                        parameter_type: Some(QueryParameterType { array_type: None, struct_types: None, r#type: "INTEGER".to_string() }),
+                        parameter_value: Some(QueryParameterValue { array_values: None, struct_values: None, value: Some("2".to_string()) }),
+                    }]),
+                    use_legacy_sql: Some(false),
+                    ..Default::default()
+                },
+                Some(2),
+            )
+            .collect::<Result<Vec<_>, _>>()
+            .await
+            .map(|vec_of_vecs| vec_of_vecs.into_iter().flatten().collect());
+
+        assert!(query_all_results_with_parameter.is_ok());
+        // 2 rows match the query: {"a":2,"b":"hello"} and {"a":3,"c":1}
+        assert_eq!(query_all_results_with_parameter.unwrap().len(), 2);
+
+        // Delete table
         client.table().delete(project_id, dataset_id, table_id).await?;
 
         // Delete dataset

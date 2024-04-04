@@ -1,6 +1,6 @@
 [package]
 name = "gcp-bigquery-client"
-version = "0.12.2"
+version = "0.18.1"
 authors = ["Laurent Querel <laurent.querel@gmail.com>"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
@@ -24,19 +24,26 @@ rust-tls = ["reqwest/rustls-tls"]
 bq_load_job = ["cloud-storage"]
 
 [dependencies]
-yup-oauth2 = "6.6.0"
+yup-oauth2 = "8.3"
 hyper = {version="0.14", features = ["http1"]}
-hyper-rustls = {version="0.23.0", features = ["native-tokio"]}
+hyper-rustls = {version="0.25", features = ["native-tokio"]}
 thiserror = "1"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "sync", "macros"] }
-reqwest = { version = "0.11", default-features = false, features = ["json"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 url = "2"
 serde = "1"
 serde_json = "1"
 log = "0.4"
-time = { version = "0.3.9", features = ["local-offset", "serde", "serde-well-known"] }
-cloud-storage = {version="0.11.0", features = ["global-client"], optional = true}
+time = { version = "0.3.22", features = ["local-offset", "serde", "serde-well-known"] }
+cloud-storage = {version="0.11.1", features = ["global-client"], optional = true}
+async-trait = "0.1.68"
+dyn-clone = "1.0.11"
 
 [dev-dependencies]
 tokio-test = "0.4"
 rand = "0.8"
+wiremock = "0.6.0"
+tempfile = "3.6.0"
+fake = "2.6.1"

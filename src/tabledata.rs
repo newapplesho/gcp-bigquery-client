@@ -1,21 +1,35 @@
 //! Manage BigQuery streaming API.
-use crate::auth::ServiceAccountAuthenticator;
+use std::sync::Arc;
+
+use crate::auth::Authenticator;
 use crate::error::BQError;
 use crate::model::data_format_options::DataFormatOptions;
 use crate::model::table_data_insert_all_request::TableDataInsertAllRequest;
 use crate::model::table_data_insert_all_response::TableDataInsertAllResponse;
-use crate::{process_response, urlencode};
+use crate::model::table_data_list_response::TableDataListResponse;
+use crate::{process_response, urlencode, BIG_QUERY_V2_URL};
 use reqwest::Client;
 
 /// A table data API handler.
+#[derive(Clone)]
 pub struct TableDataApi {
     client: Client,
-    sa_auth: ServiceAccountAuthenticator,
+    auth: Arc<dyn Authenticator>,
+    base_url: String,
 }
 
 impl TableDataApi {
-    pub(crate) fn new(client: Client, sa_auth: ServiceAccountAuthenticator) -> Self {
-        Self { client, sa_auth }
+    pub(crate) fn new(client: Client, auth: Arc<dyn Authenticator>) -> Self {
+        Self {
+            client,
+            auth,
+            base_url: BIG_QUERY_V2_URL.to_string(),
+        }
+    }
+
+    pub(crate) fn with_base_url(&mut self, base_url: String) -> &mut Self {
+        self.base_url = base_url;
+        self
     }
 
     /// Streams data into BigQuery one record at a time without needing to run a load job. Requires the WRITER dataset
@@ -32,9 +46,15 @@ impl TableDataApi {
         table_id: &str,
         insert_request: TableDataInsertAllRequest,
     ) -> Result<TableDataInsertAllResponse, BQError> {
-        let req_url = format!("https://bigquery.googleapis.com/bigquery/v2/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}/insertAll", project_id=urlencode(project_id), dataset_id=urlencode(dataset_id), table_id=urlencode(table_id));
+        let req_url = format!(
+            "{base_url}/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}/insertAll",
+            base_url = self.base_url,
+            project_id = urlencode(project_id),
+            dataset_id = urlencode(dataset_id),
+            table_id = urlencode(table_id)
+        );
 
-        let access_token = self.sa_auth.access_token().await?;
+        let access_token = self.auth.access_token().await?;
 
         let request = self
             .client
@@ -60,10 +80,16 @@ impl TableDataApi {
         dataset_id: &str,
         table_id: &str,
         parameters: ListQueryParameters,
-    ) -> Result<TableDataInsertAllResponse, BQError> {
-        let req_url = format!("https://bigquery.googleapis.com/bigquery/v2/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}/data", project_id=urlencode(project_id), dataset_id=urlencode(dataset_id), table_id=urlencode(table_id));
+    ) -> Result<TableDataListResponse, BQError> {
+        let req_url = format!(
+            "{base_url}/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}/data",
+            base_url = self.base_url,
+            project_id = urlencode(project_id),
+            dataset_id = urlencode(dataset_id),
+            table_id = urlencode(table_id)
+        );
 
-        let access_token = self.sa_auth.access_token().await?;
+        let access_token = self.auth.access_token().await?;
 
         let request = self
             .client
@@ -121,9 +147,9 @@ mod test {
     #[tokio::test]
     async fn test() -> Result<(), BQError> {
         let (ref project_id, ref dataset_id, ref table_id, ref sa_key) = env_vars();
-        let dataset_id = &format!("{}_tabledata", dataset_id);
+        let dataset_id = &format!("{dataset_id}_tabledata");
 
-        let client = Client::from_service_account_key_file(sa_key).await;
+        let client = Client::from_service_account_key_file(sa_key).await?;
 
         client.table().delete_if_exists(project_id, dataset_id, table_id).await;
         client.dataset().delete_if_exists(project_id, dataset_id, true).await;

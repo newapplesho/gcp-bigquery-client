@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{ser::Error, Deserialize, Serialize, Serializer};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -19,4 +19,14 @@ pub enum FieldType {
     Datetime,
     Record, // where RECORD indicates that the field contains a nested schema
     Struct, // same as RECORD
+    Geography,
+    Json,
+}
+
+pub fn serialize_json_as_string<S>(json: &serde_json::value::Value, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let string = serde_json::to_string(json).map_err(S::Error::custom)?;
+    s.serialize_str(&string)
 }

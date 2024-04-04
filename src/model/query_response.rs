@@ -73,7 +73,7 @@ pub struct ResultSet {
 
 impl ResultSet {
     pub fn new(query_response: QueryResponse) -> Self {
-        if query_response.job_complete.unwrap_or(false) {
+        if query_response.job_complete.unwrap_or(false) && query_response.schema.is_some() {
             // rows and tables schema are only present for successfully completed jobs.
             let row_count = query_response.rows.as_ref().map_or(0, Vec::len) as i64;
             let table_schema = query_response.schema.as_ref().expect("Expecting a schema");
@@ -164,6 +164,37 @@ impl ResultSet {
                 col_name: col_name.into(),
             }),
             Some(col_index) => self.get_i64(*col_index),
+        }
+    }
+
+    pub fn get_serde<T>(&self, col_index: usize) -> Result<Option<T>, BQError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let json_value = self.get_json_value(col_index)?;
+        match json_value {
+            None => Ok(None),
+            Some(json_value) => match serde_json::from_value::<T>(json_value.clone()) {
+                Ok(value) => Ok(Some(value)),
+                Err(_) => Err(BQError::InvalidColumnType {
+                    col_index,
+                    col_type: ResultSet::json_type(&json_value),
+                    type_requested: std::any::type_name::<T>().to_string(),
+                }),
+            },
+        }
+    }
+
+    pub fn get_serde_by_name<T>(&self, col_name: &str) -> Result<Option<T>, BQError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let col_index = self.fields.get(col_name);
+        match col_index {
+            None => Err(BQError::InvalidColumnName {
+                col_name: col_name.into(),
+            }),
+            Some(col_index) => self.get_serde(*col_index),
         }
     }
 
