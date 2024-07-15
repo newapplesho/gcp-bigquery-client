@@ -1,8 +1,8 @@
 [package]
 name = "gcp-bigquery-client"
-version = "0.18.1"
+version = "0.22.0"
 authors = ["Laurent Querel <laurent.querel@gmail.com>"]
-edition = "2018"
+edition = "2021"
 license = "MIT OR Apache-2.0"
 description = """
 An ergonomic async client library for GCP BigQuery.
@@ -16,34 +16,60 @@ keywords = ["gcp", "bigquery", "google-cloud"]
 categories = ["database"]
 
 [features]
-default = ["rust-tls"]
+default = ["rust-tls", "ring", "gzip"]
 native-tls = ["reqwest/native-tls"]
 rust-tls = ["reqwest/rustls-tls"]
+ring = ["yup-oauth2/ring"]
+aws-lc-rs = ["yup-oauth2/aws-lc-rs"]
 # Feature used to remove cloud-storage from the standard build.
 # cloud-storage has a dependency on chrono, so the feature is there to remove this dependency by default.
 bq_load_job = ["cloud-storage"]
+gzip = ["flate2"]
+
+[dependencies.flate2]
+version = "1.0"
+optional = true
 
 [dependencies]
-yup-oauth2 = "8.3"
-hyper = {version="0.14", features = ["http1"]}
-hyper-rustls = {version="0.25", features = ["native-tokio"]}
-thiserror = "1"
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "sync", "macros"] }
-tokio-stream = "0.1"
-async-stream = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
-url = "2"
-serde = "1"
-serde_json = "1"
-log = "0.4"
-time = { version = "0.3.22", features = ["local-offset", "serde", "serde-well-known"] }
-cloud-storage = {version="0.11.1", features = ["global-client"], optional = true}
-async-trait = "0.1.68"
-dyn-clone = "1.0.11"
+yup-oauth2 = { version = "11", default-features = false, features = ["hyper-rustls", "service-account"] }
+hyper = { version = "1.4.1", features = ["http1"] }
+hyper-util = { version = "0.1.6", default-features = false, features = [
+    "client-legacy",
+] }
+thiserror = "1.0.62"
+tokio = { version = "1.38.0", default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "sync",
+    "macros",
+] }
+tokio-stream = "0.1.15"
+async-stream = "0.3.5"
+reqwest = { version = "0.12.5", default-features = false, features = ["json"] }
+url = "2.5.2"
+serde = "1.0.204"
+serde_json = "1.0.120"
+log = "0.4.22"
+time = { version = "0.3.36", features = [
+    "local-offset",
+    "serde",
+    "serde-well-known",
+] }
+cloud-storage = { version = "0.11.1", features = [
+    "global-client",
+], optional = true }
+async-trait = "0.1.81"
+dyn-clone = "1.0.17"
+prost = "0.13.1"
+prost-types = "0.13.1"
+tonic = { version = "0.12", features = ["transport", "tls", "tls-roots"] }
 
 [dev-dependencies]
-tokio-test = "0.4"
-rand = "0.8"
+tokio-test = "0.4.4"
+rand = "0.8.5"
 wiremock = "0.6.0"
-tempfile = "3.6.0"
-fake = "2.6.1"
+tempfile = "3.10.1"
+fake = "2.9.2"
+
+[build-dependencies]
+tonic-build = { version = "0.12", features = ["cleanup-markdown"] }

@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.22.0] - 2024-07-07
+
+### Added
+
+- Add partial support for BigQuery Storage Write API (by @imor). 
+  - append_rows
+  - get_write_stream
+- Add GZIP support for `insert_all` (by @Deniskore). The `gzip` feature is included by default.
+  See https://github.com/lquerel/gcp-bigquery-client/issues/74 for more information.
+
+Breaking changes:
+  - Client::from_authenticator is now async.
+  - ClientBuilder::build_from_authenticator is now async.
+
+### Maintenance
+
+- Bump version of `yup_oauth2` to v11 (by @serpex). `gcp-bigquery-client` can now be used with ring or aws-lc-rs as
+  a TLS backend.
+- Fix Clippy warnings produced with Rust 1.78.0 (by @imor).
+
+## [0.21.0] - 2024-06-16
+
+### Maintenance
+
+- Bump version of yup_oauth2 to 10.0.1 (by @serpex).
+
+## [0.20.0] - 2024-04-28
+
+### Maintenance
+
+- Re-export yup_oauth2 as suggested by @serpex.
+
+## [0.19.0] - 2024-04-27
+
+### Maintenance
+
+- Re-export hyper_rustls from yup (Thanks to @DoumanAsh)
+- Bump versions of all dependencies to their most recent versions (including hyper and yup-oauth2)
+
 ## [0.18.1] - 2024-03-29
 
 ### Improvement
