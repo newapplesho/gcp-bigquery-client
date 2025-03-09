@@ -2,7 +2,10 @@
 use std::{collections::HashMap, convert::TryInto, fmt::Display, sync::Arc};
 
 use prost::Message;
-use prost_types::{field_descriptor_proto::Type, DescriptorProto, FieldDescriptorProto};
+use prost_types::{
+    field_descriptor_proto::{Label, Type},
+    DescriptorProto, FieldDescriptorProto,
+};
 use tonic::{
     transport::{Channel, ClientTlsConfig},
     Request, Streaming,
@@ -21,36 +24,65 @@ use crate::{
 };
 
 static BIG_QUERY_STORAGE_API_URL: &str = "https://bigquerystorage.googleapis.com";
+// Service Name
 static BIGQUERY_STORAGE_API_DOMAIN: &str = "bigquerystorage.googleapis.com";
 
-/// BigQuery column type
+/// Protobuf column type
 #[derive(Clone, Copy)]
 pub enum ColumnType {
-    Bool,
-    Bytes,
-    Date,
-    Datetime,
-    Json,
+    Double,
+    Float,
     Int64,
-    Float64,
+    Uint64,
+    Int32,
+    Fixed64,
+    Fixed32,
+    Bool,
     String,
-    Time,
-    Timestamp,
+    Bytes,
+    Uint32,
+    Sfixed32,
+    Sfixed64,
+    Sint32,
+    Sint64,
 }
 
 impl From<ColumnType> for Type {
     fn from(value: ColumnType) -> Self {
         match value {
-            ColumnType::Bool => Type::Bool,
-            ColumnType::Bytes => Type::Bytes,
-            ColumnType::Date => Type::String,
-            ColumnType::Datetime => Type::String,
-            ColumnType::Json => Type::String,
+            ColumnType::Double => Type::Double,
+            ColumnType::Float => Type::Float,
             ColumnType::Int64 => Type::Int64,
-            ColumnType::Float64 => Type::Float,
+            ColumnType::Uint64 => Type::Uint64,
+            ColumnType::Int32 => Type::Int32,
+            ColumnType::Fixed64 => Type::Fixed64,
+            ColumnType::Fixed32 => Type::Fixed32,
+            ColumnType::Bool => Type::Bool,
             ColumnType::String => Type::String,
-            ColumnType::Time => Type::String,
-            ColumnType::Timestamp => Type::String,
+            ColumnType::Bytes => Type::Bytes,
+            ColumnType::Uint32 => Type::Uint32,
+            ColumnType::Sfixed32 => Type::Sfixed32,
+            ColumnType::Sfixed64 => Type::Sfixed64,
+            ColumnType::Sint32 => Type::Sint32,
+            ColumnType::Sint64 => Type::Sfixed64,
+        }
+    }
+}
+
+/// Column mode
+#[derive(Clone, Copy)]
+pub enum ColumnMode {
+    Nullable,
+    Required,
+    Repeated,
+}
+
+impl From<ColumnMode> for Label {
+    fn from(value: ColumnMode) -> Self {
+        match value {
+            ColumnMode::Nullable => Label::Optional,
+            ColumnMode::Required => Label::Required,
+            ColumnMode::Repeated => Label::Repeated,
         }
     }
 }
@@ -65,6 +97,9 @@ pub struct FieldDescriptor {
 
     /// Field type
     pub typ: ColumnType,
+
+    /// Field mode
+    pub mode: ColumnMode,
 }
 
 /// A struct to describe the schema of a table in protobuf
@@ -140,7 +175,12 @@ impl StorageApi {
     }
 
     pub(crate) async fn new_write_client() -> Result<BigQueryWriteClient<Channel>, BQError> {
-        let tls_config = ClientTlsConfig::new().domain_name(BIGQUERY_STORAGE_API_DOMAIN);
+        // Since Tonic 0.12.0, TLS root certificates are no longer implicit.
+        // We need to specify them explicitly.
+        // See: https://github.com/hyperium/tonic/pull/1731
+        let tls_config = ClientTlsConfig::new()
+            .domain_name(BIGQUERY_STORAGE_API_DOMAIN)
+            .with_native_roots();
         let channel = Channel::from_static(BIG_QUERY_STORAGE_API_URL)
             .tls_config(tls_config)?
             .connect()
@@ -156,11 +196,10 @@ impl StorageApi {
     }
 
     /// Append rows to a table via the BigQuery Storage Write API.
-    pub async fn append_rows<M: Message>(
+    pub async fn append_rows(
         &mut self,
         stream_name: &StreamName,
-        table_descriptor: &TableDescriptor,
-        rows: &[M],
+        rows: append_rows_request::Rows,
         trace_id: String,
     ) -> Result<Streaming<AppendRowsResponse>, BQError> {
         let write_stream = stream_name.to_string();
@@ -171,7 +210,7 @@ impl StorageApi {
             trace_id,
             missing_value_interpretations: HashMap::new(),
             default_missing_value_interpretation: MissingValueInterpretation::Unspecified.into(),
-            rows: Some(Self::create_rows(table_descriptor, rows)),
+            rows: Some(rows),
         };
 
         let req = self
@@ -185,16 +224,38 @@ impl StorageApi {
         Ok(streaming)
     }
 
-    fn create_rows<M: Message>(table_descriptor: &TableDescriptor, rows: &[M]) -> append_rows_request::Rows {
+    /// This function encodes the `rows` slice into a protobuf message
+    /// while ensuring that the total size of the encoded rows does
+    /// not exceed the `max_size` argument. The encoded rows are returned
+    /// in the first value of the tuple returned by this function.
+    ///
+    /// Note that it is possible that not all the rows in the `rows` slice
+    /// were encoded due to the `max_size` limit.  The callers can find
+    /// out how many rows were processed by looking at the second value in
+    /// the tuple returned by this function. If the number of rows processed
+    /// is less than the number of rows in the `rows` slice, then the caller
+    /// can call this function again with the rows remaing at the end of the
+    /// slice to encode them.
+    ///
+    /// The AppendRows API has a payload size limit of 10MB. Some of the
+    /// space in the 10MB limit is used by the request metadata, so the
+    /// `max_size` argument should be set to a value less than 10MB. 9MB
+    /// is a good value to use for the `max_size` argument.
+    pub fn create_rows<M: Message>(
+        table_descriptor: &TableDescriptor,
+        rows: &[M],
+        max_size_bytes: usize,
+    ) -> (append_rows_request::Rows, usize) {
         let field_descriptors = table_descriptor
             .field_descriptors
             .iter()
             .map(|fd| {
                 let typ: Type = fd.typ.into();
+                let label: Label = fd.mode.into();
                 FieldDescriptorProto {
                     name: Some(fd.name.clone()),
                     number: Some(fd.number as i32),
-                    label: None,
+                    label: Some(label.into()),
                     r#type: Some(typ.into()),
                     type_name: None,
                     extendee: None,
@@ -222,15 +283,30 @@ impl StorageApi {
             proto_descriptor: Some(proto_descriptor),
         };
 
-        let rows = rows.iter().map(|m| m.encode_to_vec()).collect();
+        let mut serialized_rows = Vec::new();
+        let mut total_size = 0;
 
-        let proto_rows = crate::google::cloud::bigquery::storage::v1::ProtoRows { serialized_rows: rows };
+        for row in rows {
+            let encoded_row = row.encode_to_vec();
+            let current_size = encoded_row.len();
+
+            if total_size + current_size > max_size_bytes {
+                break;
+            }
+
+            serialized_rows.push(encoded_row);
+            total_size += current_size;
+        }
+
+        let num_rows_processed = serialized_rows.len();
+
+        let proto_rows = crate::google::cloud::bigquery::storage::v1::ProtoRows { serialized_rows };
 
         let proto_data = ProtoData {
             writer_schema: Some(proto_schema),
             rows: Some(proto_rows),
         };
-        append_rows_request::Rows::ProtoRows(proto_data)
+        (append_rows_request::Rows::ProtoRows(proto_data), num_rows_processed)
     }
 
     async fn new_authorized_request<D>(&self, t: D) -> Result<Request<D>, BQError> {
@@ -269,14 +345,29 @@ pub mod test {
     use crate::model::table::Table;
     use crate::model::table_field_schema::TableFieldSchema;
     use crate::model::table_schema::TableSchema;
-    use crate::storage::{ColumnType, FieldDescriptor, StreamName, TableDescriptor};
+    use crate::storage::{ColumnMode, ColumnType, FieldDescriptor, StorageApi, StreamName, TableDescriptor};
     use crate::{env_vars, Client};
     use prost::Message;
     use std::time::{Duration, SystemTime};
     use tokio_stream::StreamExt;
 
+    #[derive(Clone, PartialEq, Message)]
+    struct Actor {
+        #[prost(int32, tag = "1")]
+        actor_id: i32,
+
+        #[prost(string, tag = "2")]
+        first_name: String,
+
+        #[prost(string, tag = "3")]
+        last_name: String,
+
+        #[prost(string, tag = "4")]
+        last_update: String,
+    }
+
     #[tokio::test]
-    async fn test() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_append_rows() -> Result<(), Box<dyn std::error::Error>> {
         let (ref project_id, ref dataset_id, ref table_id, ref sa_key) = env_vars();
         let dataset_id = &format!("{dataset_id}_storage");
 
@@ -322,39 +413,28 @@ pub mod test {
                 name: "actor_id".to_string(),
                 number: 1,
                 typ: ColumnType::Int64,
+                mode: ColumnMode::Nullable,
             },
             FieldDescriptor {
                 name: "first_name".to_string(),
                 number: 2,
                 typ: ColumnType::String,
+                mode: ColumnMode::Nullable,
             },
             FieldDescriptor {
                 name: "last_name".to_string(),
                 number: 3,
                 typ: ColumnType::String,
+                mode: ColumnMode::Nullable,
             },
             FieldDescriptor {
                 name: "last_update".to_string(),
                 number: 4,
-                typ: ColumnType::Timestamp,
+                typ: ColumnType::String,
+                mode: ColumnMode::Nullable,
             },
         ];
         let table_descriptor = TableDescriptor { field_descriptors };
-
-        #[derive(Clone, PartialEq, Message)]
-        struct Actor {
-            #[prost(int32, tag = "1")]
-            actor_id: i32,
-
-            #[prost(string, tag = "2")]
-            first_name: String,
-
-            #[prost(string, tag = "3")]
-            last_name: String,
-
-            #[prost(string, tag = "4")]
-            last_update: String,
-        }
 
         let actor1 = Actor {
             actor_id: 1,
@@ -373,16 +453,66 @@ pub mod test {
         let stream_name = StreamName::new_default(project_id.clone(), dataset_id.clone(), table_id.clone());
         let trace_id = "test_client".to_string();
 
-        let mut streaming = client
-            .storage_mut()
-            .append_rows(&stream_name, &table_descriptor, &[actor1, actor2], trace_id)
-            .await?;
+        let rows: &[Actor] = &[actor1, actor2];
 
-        while let Some(resp) = streaming.next().await {
-            let resp = resp?;
-            println!("response: {resp:#?}");
-        }
+        let max_size = 9 * 1024 * 1024; // 9 MB
+        let num_append_rows_calls = call_append_rows(
+            &mut client,
+            &table_descriptor,
+            &stream_name,
+            trace_id.clone(),
+            rows,
+            max_size,
+        )
+        .await?;
+        assert_eq!(num_append_rows_calls, 1);
+
+        // It was found after experimenting that one row in this test encodes to about 38 bytes
+        // We artificially limit the size of the rows to test that the loop processes all the rows
+        let max_size = 50; // 50 bytes
+        let num_append_rows_calls =
+            call_append_rows(&mut client, &table_descriptor, &stream_name, trace_id, rows, max_size).await?;
+        assert_eq!(num_append_rows_calls, 2);
 
         Ok(())
+    }
+
+    async fn call_append_rows(
+        client: &mut Client,
+        table_descriptor: &TableDescriptor,
+        stream_name: &StreamName,
+        trace_id: String,
+        mut rows: &[Actor],
+        max_size: usize,
+    ) -> Result<u8, Box<dyn std::error::Error>> {
+        // This loop is needed because the AppendRows API has a payload size limit of 10MB and the create_rows
+        // function may not process all the rows in the rows slice due to the 10MB limit. Even though in this
+        // example we are only sending two rows (which won't breach the 10MB limit), in a real-world scenario,
+        // we may have to send more rows and the loop will be needed to process all the rows.
+        let mut num_append_rows_calls = 0;
+        loop {
+            let (encoded_rows, num_processed) = StorageApi::create_rows(table_descriptor, rows, max_size);
+            let mut streaming = client
+                .storage_mut()
+                .append_rows(stream_name, encoded_rows, trace_id.clone())
+                .await?;
+
+            num_append_rows_calls += 1;
+
+            while let Some(resp) = streaming.next().await {
+                let resp = resp?;
+                println!("response: {resp:#?}");
+            }
+
+            // All the rows have been processed
+            if num_processed == rows.len() {
+                break;
+            }
+
+            // Process the remaining rows
+            rows = &rows[num_processed..];
+        }
+
+        Ok(num_append_rows_calls)
     }
 }

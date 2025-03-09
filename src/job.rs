@@ -17,7 +17,7 @@ use crate::model::job_list::JobList;
 use crate::model::job_list_parameters::JobListParameters;
 use crate::model::job_reference::JobReference;
 use crate::model::query_request::QueryRequest;
-use crate::model::query_response::{QueryResponse, ResultSet};
+use crate::model::query_response::QueryResponse;
 use crate::model::table_row::TableRow;
 use crate::{process_response, urlencode, BIG_QUERY_V2_URL};
 
@@ -48,7 +48,7 @@ impl JobApi {
     /// # Arguments
     /// * `project_id` - Project ID of the query request.
     /// * `query_request` - The request body contains an instance of QueryRequest.
-    pub async fn query(&self, project_id: &str, query_request: QueryRequest) -> Result<ResultSet, BQError> {
+    pub async fn query(&self, project_id: &str, query_request: QueryRequest) -> Result<QueryResponse, BQError> {
         let req_url = format!(
             "{base_url}/projects/{project_id}/queries",
             base_url = self.base_url,
@@ -67,7 +67,7 @@ impl JobApi {
         let resp = self.client.execute(request).await?;
 
         let query_response: QueryResponse = process_response(resp).await?;
-        Ok(ResultSet::new(query_response))
+        Ok(query_response)
     }
 
     /// Runs a BigQuery SQL query, paginating through all the results synchronously.
@@ -75,7 +75,7 @@ impl JobApi {
     /// * `project_id`- Project ID of the query request.
     /// * `query` - The initial query configuration that is submitted when the job is inserted.
     /// * `page_size` - The size of each page fetched. By default, this is set to `None`, and the limit is 10 MB of
-    /// rows instead.
+    ///   rows instead.
     pub fn query_all<'a>(
         &'a self,
         project_id: &'a str,
@@ -135,7 +135,7 @@ impl JobApi {
     /// * `location`  - Geographic location of the job.
     /// * `query` - The initial query configuration that is submitted when the job is inserted.
     /// * `page_size` - The size of each page fetched. By default, this is set to `None`, and the limit is 10 MB of
-    /// rows instead.
+    ///   rows instead.
     pub fn query_all_with_location<'a>(
         &'a self,
         project_id: &'a str,
@@ -204,7 +204,7 @@ impl JobApi {
     /// * `job_reference` - The initital job reference configuration that is submitted when the job is inserted
     /// * `query` - The initial query configuration that is submitted when the job is inserted.
     /// * `page_size` - The size of each page fetched. By default, this is set to `None`, and the limit is 10 MB of
-    /// rows instead.
+    ///   rows instead.
     pub fn query_all_with_job_reference<'a>(
         &'a self,
         project_id: &'a str,
@@ -388,7 +388,7 @@ impl JobApi {
     /// * `project_id` - Project ID of the requested job.
     /// * `job_id` - Job ID of the requested job.
     /// * `location` - The geographic location of the job. Required except for US and EU. See
-    /// details at https://cloud.google.com/bigquery/docs/locations#specifying_your_location.
+    ///   details at https://cloud.google.com/bigquery/docs/locations#specifying_your_location.
     pub async fn get_job(&self, project_id: &str, job_id: &str, location: Option<&str>) -> Result<Job, BQError> {
         let req_url = format!(
             "{base_url}/projects/{project_id}/jobs/{job_id}",
@@ -418,7 +418,7 @@ impl JobApi {
     /// * `project_id` - Project ID of the job to cancel.
     /// * `job_id` - Job ID of the job to cancel.
     /// * `location` - The geographic location of the job. Required except for US and EU. See
-    /// details at https://cloud.google.com/bigquery/docs/locations#specifying_your_location.
+    ///   details at https://cloud.google.com/bigquery/docs/locations#specifying_your_location.
     pub async fn cancel_job(
         &self,
         project_id: &str,
@@ -626,7 +626,7 @@ mod test {
         assert!(result.insert_errors.is_none(), "{:?}", result);
 
         // Query
-        let mut rs = client
+        let query_response = client
             .job()
             .query(
                 project_id,
@@ -635,19 +635,21 @@ mod test {
                 )),
             )
             .await?;
-        while rs.next_row() {
-            assert!(rs.get_i64_by_name("c")?.is_some());
-        }
 
         // Get job id
-        let job_id = rs
-            .query_response()
+        let job_id = query_response
             .job_reference
             .as_ref()
             .expect("expected job_reference")
             .job_id
             .clone()
             .expect("expected job_id");
+
+        let mut rs = ResultSet::new_from_query_response(query_response);
+
+        while rs.next_row() {
+            assert!(rs.get_i64_by_name("c")?.is_some());
+        }
 
         let job = client.job_api.get_job(project_id, &job_id, None).await?;
         assert_eq!(job.status.unwrap().state.unwrap(), "DONE");
@@ -657,7 +659,7 @@ mod test {
             .job()
             .get_query_results(project_id, &job_id, Default::default())
             .await?;
-        let mut query_results_rs = ResultSet::new(QueryResponse::from(query_results));
+        let mut query_results_rs = ResultSet::new_from_query_response(QueryResponse::from(query_results));
         assert_eq!(query_results_rs.row_count(), rs.row_count());
         while query_results_rs.next_row() {
             assert!(rs.get_i64_by_name("c")?.is_some());
